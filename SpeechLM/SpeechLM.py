@@ -215,7 +215,12 @@ class SpeechLM(nn.Module):
                 use_rel_pos_enc=cfg.use_rel_pos_enc,
                 scaling_for_att=cfg.scaling_for_att,
             )
-            
+        
+        # build label embedding list, that allow to convert
+        # embeddings before and after unit encoder to discrete values
+        # dimensions are hardcoded according to dimensions in checkpoint
+        self.label_embs_list = nn.ParameterList([nn.Parameter(torch.FloatTensor(352, 256)) for _ in range(2)])
+
         ### build unit2text decoder, not available for now
         self.add_decoder = cfg.add_decoder
 
@@ -297,8 +302,8 @@ class SpeechLM(nn.Module):
         padding_mask: torch.Tensor,
     ) -> torch.Tensor:
         extra = padding_mask.size(1) % features.size(1)
-        if extra > 0:
-            padding_mask = padding_mask[:, :-extra]
+        slice_indices = (slice(None), slice(0, padding_mask.size(1) - extra))
+        padding_mask = padding_mask[slice_indices]
         padding_mask = padding_mask.view(padding_mask.size(0), features.size(1), -1)
         padding_mask = padding_mask.all(-1)
         return padding_mask
@@ -366,7 +371,8 @@ class SpeechLM(nn.Module):
             soft_embeddings, (B, T, D)
             l2_loss, a loss
         """
-        soft_embeddings = self.final_proj_list[0](x) if x.size(-1) == self.final_dim else x
+        # soft_embeddings = self.final_proj_list[0](x) if x.size(-1) == self.final_dim else x
+        soft_embeddings = x  # called once, where 1024 != 256, thus no projection
         if padding_mask is None:
             padding_mask = soft_embeddings.new_zeros(soft_embeddings.size(0), soft_embeddings.size(1), dtype=torch.long)
         if use_pred_unit:
@@ -625,12 +631,20 @@ class SpeechLM(nn.Module):
                 res["x"] = encoder_out['encoder_out'][0].transpose(0, 1)  # (B, T, D)
                 if return_all_hiddens:
                     res["layer_results"] += encoder_out['encoder_states'][1:1+output_layer-len(res["layer_results"])]
+
+                proj_x = self.final_proj_list[-1](res["x"])
+                proj_x_norm = F.normalize(proj_x.float(), dim=-1)
+                label_embs = self.label_embs_list[-1]
+                label_embs = F.normalize(label_embs.float(), dim=-1)
+                logits = torch.matmul(proj_x_norm, label_embs.T).type_as(proj_x)
+                res["logits"] = logits
             
             feature = res["features"] if ret_conv else res["x"]
+            logits = res["logits"] if "logits" in res else None
             if ret_layer_results:
                 feature = (feature, res["layer_results"])
 
-            return feature, padding_mask
+            return feature, padding_mask, logits
 
     def get_logits(self, net_output, is_masked=True):
         if is_masked:

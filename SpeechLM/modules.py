@@ -20,6 +20,8 @@ from torch.nn import Parameter
 from torch import Tensor
 from typing import Any, Dict, List, Tuple, Callable, Optional
 
+from fairseq.incremental_decoding_utils import with_incremental_state
+
 logger = logging.getLogger(__name__)
 
 # rewrite name for backward compatibility in `make_generation_fast_`
@@ -388,13 +390,8 @@ def pad_to_multiple(x, multiple, dim=-1, value=0):
     # Inspired from https://github.com/lucidrains/local-attention/blob/master/local_attention/local_attention.py#L41
     if x is None:
         return None, 0
-    tsz = x.size(dim)
-    m = tsz / multiple
-    remainder = math.ceil(m) * multiple - tsz
-    if m.is_integer():
-        return x, 0
     pad_offset = (0,) * (-1 - dim) * 2
-
+    remainder = x.size(dim) % multiple
     return F.pad(x, (*pad_offset, 0, remainder), value=value), remainder
 
 def is_xla_tensor(tensor):
@@ -617,8 +614,7 @@ class TransformerEncoderBase(nn.Module):
         x, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
 
         # account for padding while computing the representation
-        if has_pads:
-            x = x * (1 - encoder_padding_mask.unsqueeze(-1).type_as(x))
+        x = x * (1 - encoder_padding_mask.unsqueeze(-1).type_as(x))
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
@@ -643,7 +639,7 @@ class TransformerEncoderBase(nn.Module):
         # encoder layers
         for i, layer in enumerate(self.layers):
             x = layer(
-                x, encoder_padding_mask=encoder_padding_mask if has_pads else None,
+                x, encoder_padding_mask=encoder_padding_mask,
                 pos_bias=pos_k,
             )
             if uniformity_layers is not None and i+1 in uniformity_layers:
@@ -1010,9 +1006,6 @@ class TransformerEncoder(nn.Module):
 
     def extract_features(self, x, padding_mask=None, tgt_layer=None, conv_pos=True):
 
-        if padding_mask is not None:
-            x = index_put(x, padding_mask, 0)
-
         if conv_pos:
             x_conv = self.pos_conv(x.transpose(1, 2))
             x_conv = x_conv.transpose(1, 2)
@@ -1025,13 +1018,9 @@ class TransformerEncoder(nn.Module):
         x, pad_length = pad_to_multiple(
             x, self.required_seq_len_multiple, dim=-2, value=0
         )
-        if pad_length > 0 and padding_mask is None:
-            padding_mask = x.new_zeros((x.size(0), x.size(1)), dtype=torch.bool)
-            padding_mask[:, -pad_length:] = True
-        else:
-            padding_mask, _ = pad_to_multiple(
-                padding_mask, self.required_seq_len_multiple, dim=-1, value=True
-            )
+        padding_mask = x.new_ones((x.size(0), x.size(1)), dtype=torch.bool)
+        false_indices = (slice(None), slice(0, x.size(1) - pad_length))
+        padding_mask[false_indices] = False
         x = F.dropout(x, p=self.dropout, training=self.training)
 
         # B x T x C -> T x B x C
@@ -1076,8 +1065,9 @@ class TransformerEncoder(nn.Module):
         # T x B x C -> B x T x C
         x = x.transpose(0, 1)
         # undo paddding
-        if pad_length > 0:
-            x = x[:, :-pad_length]
+        slice_indices = [slice(None)] * 3
+        slice_indices[1] = slice(0, x.size(1) - pad_length)
+        x = x[tuple(slice_indices)]
 
         return x, layer_results
 
@@ -1333,7 +1323,7 @@ class SinusoidalPositionalEmbedding(nn.Module):
         )
         if embedding_dim % 2 == 1:
             # zero pad
-            emb = torch.cat([emb, torch.zeros(num_embeddings, 1)], dim=1)
+            emb = torch.cat([emb, torch.zeros(num_embeddings, 1, device=emb.device)], dim=1)
         if padding_idx is not None:
             emb[padding_idx, :] = 0
         return emb
@@ -1479,6 +1469,7 @@ class RelativePositionalEncoding(torch.nn.Module):
             return self.pe_k(pos_seq), None
 
 
+@with_incremental_state
 class MultiheadAttention(nn.Module):
     """Multi-headed attention.
 
@@ -1616,14 +1607,6 @@ class MultiheadAttention(nn.Module):
 
         tgt_len, bsz, embed_dim = query.size()
         src_len = tgt_len
-        assert embed_dim == self.embed_dim, f"query dim {embed_dim} != {self.embed_dim}"
-        assert list(query.size()) == [tgt_len, bsz, embed_dim]
-        if key is not None:
-            src_len, key_bsz, _ = key.size()
-            if not torch.jit.is_scripting():
-                assert key_bsz == bsz
-                assert value is not None
-                assert src_len, bsz == value.shape[:2]
 
         if (
             not self.onnx_trace
@@ -1690,8 +1673,8 @@ class MultiheadAttention(nn.Module):
             q = self.q_proj(query)
             k = self.k_proj(key)
             v = self.v_proj(value)
-        q *= self.scaling
-        q *= (1 / self.scaling_for_att)
+        q = q * self.scaling
+        q = q * (1 / self.scaling_for_att)
 
         if self.bias_k is not None:
             assert self.bias_v is not None
@@ -1768,16 +1751,11 @@ class MultiheadAttention(nn.Module):
             assert incremental_state is not None
             incremental_state = self._set_input_buffer(incremental_state, saved_state)
         assert k is not None
-        assert k.size(1) == src_len
 
         # This is part of a workaround to get around fork/join parallelism
         # not supporting Optional types.
         if key_padding_mask is not None and key_padding_mask.dim() == 0:
             key_padding_mask = None
-
-        if key_padding_mask is not None:
-            assert key_padding_mask.size(0) == bsz
-            assert key_padding_mask.size(1) == src_len
 
         if self.add_zero_attn:
             assert v is not None
@@ -1792,7 +1770,7 @@ class MultiheadAttention(nn.Module):
                 key_padding_mask = torch.cat(
                     [
                         key_padding_mask,
-                        torch.zeros(key_padding_mask.size(0), 1).type_as(
+                        torch.zeros(key_padding_mask.size(0), 1, device=key_padding_mask.device).type_as(
                             key_padding_mask
                         ),
                     ],
@@ -1815,7 +1793,6 @@ class MultiheadAttention(nn.Module):
             attn_weights += B
 
         attn_weights *= self.scaling_for_att
-        assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
 
         if attn_mask is not None:
             attn_mask = attn_mask.unsqueeze(0)
@@ -1851,7 +1828,6 @@ class MultiheadAttention(nn.Module):
 
         assert v is not None
         attn = torch.bmm(attn_probs, v)
-        assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
         if self.onnx_trace and attn.size(1) == 1:
             # when ONNX tracing a single decoder step (sequence length == 1)
             # the transpose is a no-op copy before view, thus unnecessary

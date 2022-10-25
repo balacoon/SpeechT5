@@ -246,6 +246,46 @@ If you find our work is useful in your research, please cite the following paper
 }
 ```
 
+## Export
+
+Repo is forked to enable pseudo annotation of audio with some content-justified labels.
+For this, we need to install deps first:
+
+```bash
+git submodule update --init fairseq
+pip install --editable fairseq/
+pip install torch torchaudio espnet matplotlib
+```
+
+Download pretrained SpeechLM models. For extra quality, we go with large:
+
+```
+https://msranlcmtteamdrive.blob.core.windows.net/share/speechlm/speechlmp_large_checkpoint_clean.pt?sv=2020-10-02&st=2022-10-13T06%3A15%3A13Z&se=2023-10-14T06%3A15%3A00Z&sr=c&sp=rl&sig=b0RFMEsG5ch3OA2%2FTTsoG5DFnLTE9c%2BeHKFJKcHI3Xg%3D
+https://drive.google.com/file/d/1QjLIgTJKIylVIp5hUkfSjGPtz8Xo7Lky/view?usp=sharing
+```
+
+Both cleaned and original versions are needed, because we want to restore
+discretization of output from original model.
+Model code is modified to enable model tracing, so later one can run inference
+without depending on fairseq
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python3 create_balacoon_pretrained.py --out-dir traced_on_gpu --use-gpu
+```
+
+That will create `traced_on_gpu/speechlm_large.jit`. It can be invoked
+on separate audios or batches. Model takes 16kHz audio, applies
+frame_shift of 320 samples (i.e. frame rate in the output is 50Hz),
+and has dictionary of 352 pseudo token. To invoke model, one runs
+
+```python
+model = torch.jit.load("speechlm_psedo_labeling.jit").cuda()
+rms_audio, _ = torchaudio.load("rms_artic_a0001.wav")  # (1 x samples_num)
+rms_audio = rms_audio.cuda()
+rms_audio_len = torch.tensor([rms_audio.size(1)], device=rms_audio.device, dtype=torch.int)
+rms_labels = model(rms_audio, rms_audio_len)
+```
+
 ### Contact Information
 
 For help or issues using SpeechLM models, please submit a GitHub issue.
