@@ -270,25 +270,13 @@ Model code is modified to enable model tracing, so later one can run inference
 without depending on fairseq
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python3 create_balacoon_pretrained.py --out-dir traced_on_gpu --use-gpu
+CUDA_VISIBLE_DEVICES=1 python3 trace.py --out-dir traced_gpu_half
 ```
 
-That will create `traced_on_gpu/speechlm_large.jit`. It can be invoked
+That will create `traced_gpu_half/speechlm.jit`. It can be invoked
 on separate audios or batches. Model takes 16kHz audio, applies
 frame_shift of 320 samples (i.e. frame rate in the output is 50Hz),
-and has dictionary of 352 pseudo token. To invoke model, one runs
+and has dictionary of 352 pseudo token.
 
-```python
-model = torch.jit.load("speechlm_psedo_labeling.jit").cuda()
-rms_audio, _ = torchaudio.load("rms_artic_a0001.wav")  # (1 x samples_num)
-rms_audio = rms_audio.cuda()
-rms_audio_len = torch.tensor([rms_audio.size(1)], device=rms_audio.device, dtype=torch.int)
-rms_labels = model(rms_audio, rms_audio_len)
-```
-
-### Contact Information
-
-For help or issues using SpeechLM models, please submit a GitHub issue.
-
-For other communications related to SpeechLM, please contact Long Zhou (`lozhou@microsoft.com`).
-
+One can check how model is executed in `test.py`, that checks that embeddings
+extracted for audio with same content but from different speakers is similar.
